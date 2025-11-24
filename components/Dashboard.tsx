@@ -18,6 +18,7 @@ import {
   extractBooleanFilters,
   extractEspecialidad,
   flattenJson,
+  runAdvancedPerformanceTests,
   runSimilarityBenchmarks,
 } from '@/lib/analysis';
 
@@ -57,43 +58,54 @@ function downloadBlob(content: Blob, filename: string) {
 function validateFormValues(values: FormValues, dynamicKeys: { key: string; type: 'boolean' | 'text' }[]): ValidationErrorBag {
   const errors: ValidationErrorBag = {};
 
-  if (!values.nombre.trim()) errors.nombre = 'El nombre es obligatorio';
-  if (values.nombre && values.nombre.trim().length < 2) errors.nombre = 'Introduce al menos 2 caracteres para el nombre';
+  const nombre = values.nombre?.trim() ?? '';
+  if (!nombre) errors.nombre = 'El nombre es obligatorio';
+  else if (nombre.length < 2) errors.nombre = 'Nombre demasiado corto (mínimo 2 caracteres)';
+  else if (nombre.length > 80) errors.nombre = 'El nombre no puede superar los 80 caracteres';
 
-  if (!values.apellidos.trim()) errors.apellidos = 'Los apellidos son obligatorios';
-  if (values.apellidos && values.apellidos.trim().length < 2)
-    errors.apellidos = 'Introduce al menos 2 caracteres para los apellidos';
+  const apellidos = values.apellidos?.trim() ?? '';
+  if (!apellidos) errors.apellidos = 'Los apellidos son obligatorios';
+  else if (apellidos.length < 2) errors.apellidos = 'Apellidos demasiado cortos (mínimo 2 caracteres)';
+  else if (apellidos.length > 120) errors.apellidos = 'Los apellidos no pueden superar los 120 caracteres';
 
-  if (values.nif) {
-    if (!/^\d{8}[A-Za-z]$/.test(values.nif)) {
-      errors.nif = 'El DNI/NIE no cumple el formato esperado (8 dígitos + letra).';
+  const nif = values.nif?.trim();
+  if (nif && !/^\d{8}[A-Za-z]$/.test(nif)) {
+    errors.nif = 'El DNI/NIE no tiene el formato correcto (8 dígitos y una letra)';
+  }
+
+  const email = values.email?.trim();
+  if (!email) errors.email = 'El correo electrónico es obligatorio';
+  else if (!/.+@.+\..+/.test(email)) errors.email = 'El email no es válido';
+
+  if (values.tasas !== undefined && !['Sí', 'No'].includes(String(values.tasas))) {
+    errors.tasas = 'Debe seleccionar "Sí" o "No" para tasas';
+  }
+
+  if (values.especialidad) {
+    if (values.especialidad.length < 3) {
+      errors.especialidad = 'La especialidad debe tener al menos 3 caracteres';
+    } else if (values.especialidad.length > 120) {
+      errors.especialidad = 'La especialidad no puede exceder 120 caracteres';
     }
   }
 
-  if (values.email) {
-    if (!/.+@.+\..+/.test(values.email)) {
-      errors.email = 'El email no es válido.';
+  if (values.comentarios) {
+    if (values.comentarios.length > 500) {
+      errors.comentarios = 'Comentarios no pueden exceder 500 caracteres';
     }
-  } else {
-    errors.email = 'El correo electrónico es obligatorio';
-  }
-
-  if (values.tasas && !['Sí', 'No'].includes(String(values.tasas))) {
-    errors.tasas = 'Seleccione una opción válida para tasas';
-  }
-
-  if (values.especialidad && values.especialidad.length < 3) {
-    errors.especialidad = 'La especialidad debe tener al menos 3 caracteres';
-  }
-
-  if (values.comentarios && values.comentarios.length > 500) {
-    errors.comentarios = 'El comentario no debe exceder los 500 caracteres';
   }
 
   dynamicKeys.forEach((field) => {
     const value = values[field.key];
-    if (field.type === 'text' && typeof value === 'string' && value.length > 200) {
-      errors[field.key] = 'Este campo no debe superar los 200 caracteres';
+    if (field.type === 'boolean') {
+      if (value !== undefined && typeof value !== 'boolean') {
+        errors[field.key] = 'Debe seleccionar un valor válido';
+      }
+    }
+    if (field.type === 'text' && typeof value === 'string') {
+      if (value.length > 200) {
+        errors[field.key] = 'Este campo no debe superar los 200 caracteres';
+      }
     }
   });
 
@@ -145,8 +157,18 @@ function buildStyledPdf(title: string, sections: { heading: string; lines: strin
     ])
     .map(escapeLine);
 
-  const textInstructions = ['BT', '/F1 18 Tf', '18 TL', '72 740 Td', `(${header}) Tj`, '/F1 12 Tf', '0 -22 Td']
-    .concat(['(-----------------------------------------------) Tj'])
+  const textInstructions = [
+    'BT',
+    '/F1 20 Tf',
+    '20 TL',
+    '72 760 Td',
+    `(${header}) Tj`,
+    '/F1 12 Tf',
+    '0 -22 Td',
+    '(___________________________________________________) Tj',
+    '/F1 11 Tf',
+    '0 -18 Td',
+  ]
     .concat(bodyLines.map((line) => `T* (${line}) Tj`))
     .concat(['ET'])
     .join('\n');
@@ -177,6 +199,49 @@ function buildStyledPdf(title: string, sections: { heading: string; lines: strin
   pdf += `trailer<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefOffset}\n%%EOF`;
 
   return new Blob([pdf], { type: 'application/pdf' });
+}
+
+function generateRefinedPdf(
+  values: FormValues,
+  dynamicFields: { key: string; label: string; type: 'boolean' | 'text' }[]
+): Blob {
+  const fieldLines = dynamicFields.map((field) => {
+    const value = values[field.key];
+    const label = field.label;
+    if (typeof value === 'boolean') return `${label}: ${value ? 'Sí' : 'No'}`;
+    if (typeof value === 'string' && value.trim().length > 0) return `${label}: ${value}`;
+    return `${label}: -`;
+  });
+
+  const sections = [
+    {
+      heading: 'Datos de contacto',
+      lines: [
+        `Nombre: ${values.nombre || '-'}`,
+        `Apellidos: ${values.apellidos || '-'}`,
+        `DNI/NIE: ${values.nif || '-'}`,
+        `Email: ${values.email || '-'}`,
+      ],
+    },
+    {
+      heading: 'Convocatoria detectada',
+      lines: [
+        `Especialidad: ${values.especialidad || '-'}`,
+        `¿Pide tasas?: ${values.tasas ?? 'No'}`,
+        ...fieldLines,
+      ],
+    },
+    {
+      heading: 'Comentarios',
+      lines: [values.comentarios || 'Sin observaciones'],
+    },
+    {
+      heading: 'Generado',
+      lines: [`Fecha: ${new Date().toLocaleString()}`],
+    },
+  ];
+
+  return buildStyledPdf('Solicitud AuditIA', sections);
 }
 
 export function Dashboard() {
@@ -356,16 +421,16 @@ export function Dashboard() {
     if (!filteredConcursos.length) return;
 
     const headers = [
-      'Archivo',
-      'Fecha',
-      'Estado',
-      'Especialidad',
-      'Descripción',
-      'Tasas',
-      'Adaptación discapacidad',
-      'Carnet de bombero',
-      'Carnet de medicina',
-      'Comentarios',
+      'nombre_archivo',
+      'fecha',
+      'estado',
+      'especialidad',
+      'descripcion',
+      'tasas',
+      'adaptacion_discapacidad',
+      'carnet_bombero',
+      'carnet_medicina',
+      'comentarios',
     ];
 
     const rows = filteredConcursos.map((item) => {
@@ -377,7 +442,7 @@ export function Dashboard() {
         formatDate(item.fecha),
         item.estado,
         extractEspecialidad(item.json_datos) || 'Sin especialidad',
-        descripcion,
+        descripcion || 'Sin descripción',
         bloques.pide_tasas ? 'Sí' : 'No',
         bloques.solicita_adaptacion_discapacidad ? 'Sí' : 'No',
         bloques.especialidad_carnet_bombero ? 'Sí' : 'No',
@@ -438,41 +503,7 @@ export function Dashboard() {
       return;
     }
 
-    const fieldLines = dynamicFields.map((field) => {
-      const value = formValues[field.key];
-      const label = field.label;
-      if (typeof value === 'boolean') return `${label}: ${value ? 'Sí' : 'No'}`;
-      return `${label}: ${value ?? '-'}`;
-    });
-
-    const sections = [
-      {
-        heading: 'Datos de contacto',
-        lines: [
-          `Nombre: ${formValues.nombre || '-'}`,
-          `Apellidos: ${formValues.apellidos || '-'}`,
-          `DNI/NIE: ${formValues.nif || '-'}`,
-          `Email: ${formValues.email || '-'}`,
-        ],
-      },
-      {
-        heading: 'Convocatoria detectada',
-        lines: [
-          `Especialidad: ${formValues.especialidad || '-'}`,
-          `¿Pide tasas?: ${formValues.tasas ?? 'No'}`,
-          ...fieldLines,
-        ],
-      },
-      {
-        heading: 'Comentarios',
-        lines: [formValues.comentarios || 'Sin observaciones'],
-      },
-      {
-        heading: 'Generado',
-        lines: [`Fecha: ${new Date().toLocaleString()}`],
-      },
-    ];
-    const blob = buildStyledPdf('Solicitud AuditIA', sections);
+    const blob = generateRefinedPdf(formValues, dynamicFields);
     downloadBlob(blob, 'auditia-formulario.pdf');
   }, [dynamicFields, formValues]);
 
@@ -487,7 +518,16 @@ export function Dashboard() {
     const summary = results
       .map((item) => `${(item.threshold * 100).toFixed(0)}% → ${item.clusters} grupos en ${item.durationMs.toFixed(1)}ms`)
       .join(' | ');
-    setBenchmarkSummary(summary);
+
+    const advanced = runAdvancedPerformanceTests(filteredConcursos);
+    const advancedSummary = advanced
+      .map(
+        (item) =>
+          `${item.strategy === 'threshold' ? 'Umbral' : 'K-Means'} ${(item.threshold * 100).toFixed(0)}% → ${item.clusters} grupos en ${item.durationMs.toFixed(1)}ms`
+      )
+      .join(' | ');
+
+    setBenchmarkSummary(`${summary} || ${advancedSummary}`);
     setIsBenchmarking(false);
   }, [clusterStrategy, filteredConcursos, similarityThreshold]);
 
@@ -497,13 +537,15 @@ export function Dashboard() {
     }
 
     return (
-      <ul className="mt-2 space-y-1">
-        {differences.map((diff) => (
-          <li key={diff.label} className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="px-2 py-1 bg-slate-100 text-slate-700 rounded-full font-semibold">{diff.label}</span>
-            <span className="line-through text-red-600">{diff.previous}</span>
-            <span className="text-slate-400">→</span>
-            <span className="text-green-700 font-semibold">{diff.current}</span>
+      <ul className="mt-2 space-y-2">
+        {differences.map((diff, index) => (
+          <li key={`${diff.label}-${index}`} className="rounded-lg bg-slate-50 px-3 py-2 text-xs">
+            <div className="flex items-center gap-2 text-slate-800">
+              <span className="font-semibold text-red-600">{diff.label}:</span>
+              <span className="line-through text-red-500">{diff.previous || 'N/A'}</span>
+              <span className="text-slate-400">→</span>
+              <span className="text-green-700 font-semibold">{diff.current || 'N/A'}</span>
+            </div>
           </li>
         ))}
       </ul>

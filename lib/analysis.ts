@@ -266,11 +266,37 @@ export function runSimilarityBenchmarks(
   strategy: ClusterStrategy = 'threshold'
 ): { threshold: number; durationMs: number; clusters: number }[] {
   return thresholds.map((threshold) => {
-    const start = performance.now();
+    const start = typeof performance !== 'undefined' ? performance.now() : Date.now();
     const groups = clusterConcursos(concursos, { similarityThreshold: threshold, strategy });
-    const end = performance.now();
+    const end = typeof performance !== 'undefined' ? performance.now() : Date.now();
     return { threshold, durationMs: end - start, clusters: groups.length };
   });
+}
+
+export function runAdvancedPerformanceTests(
+  concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[]
+): { strategy: ClusterStrategy; threshold: number; durationMs: number; clusters: number }[] {
+  const thresholds = [0.4, 0.5, 0.6, 0.7];
+  const strategies: ClusterStrategy[] = ['threshold', 'kmeans'];
+  const results: { strategy: ClusterStrategy; threshold: number; durationMs: number; clusters: number }[] = [];
+
+  thresholds.forEach((threshold) => {
+    strategies.forEach((strategy) => {
+      const startTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const clusters = clusterConcursos(concursos, { similarityThreshold: threshold, strategy });
+      const endTime = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const durationMs = endTime - startTime;
+      results.push({ strategy, threshold, durationMs, clusters: clusters.length });
+      // eslint-disable-next-line no-console
+      console.log(
+        `Cluster Strategy: ${strategy}, Threshold: ${(threshold * 100).toFixed(0)}%, Duration: ${durationMs.toFixed(
+          2
+        )}ms, Clusters: ${clusters.length}`
+      );
+    });
+  });
+
+  return results;
 }
 
 export function rankSimilarConcursos(
