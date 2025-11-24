@@ -17,6 +17,13 @@ export type MatchResult = {
   nombre_archivo: string;
   score: number;
   descripcion?: string;
+  diferencias?: string[];
+};
+
+type DifferenceConfig = {
+  label: string;
+  path: string[];
+  formatter?: (value: unknown) => string;
 };
 
 function normalizeText(value: unknown): string {
@@ -76,7 +83,10 @@ function cosineSimilarity(a: string, b: string): number {
   return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
-export function clusterConcursos(concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[]): ClusterGroup[] {
+export function clusterConcursos(
+  concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[],
+  similarityThreshold = 0.6
+): ClusterGroup[] {
   const clusters: ClusterGroup[] = [];
 
   concursos.forEach((concurso) => {
@@ -86,7 +96,7 @@ export function clusterConcursos(concursos: { id?: number; nombre_archivo: strin
 
     for (const cluster of clusters) {
       const sim = cosineSimilarity(cluster.label, resumen);
-      if (sim > 0.55) {
+      if (sim >= similarityThreshold) {
         targetCluster = cluster;
         break;
       }
@@ -128,6 +138,67 @@ export function rankSimilarConcursos(
         nombre_archivo: concurso.nombre_archivo,
         score,
         descripcion: extractEspecialidad(concurso.json_datos),
+      };
+    })
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 10);
+}
+
+function getValueFromPath(json: Record<string, unknown> | undefined, path: string[]): unknown {
+  return path.reduce<unknown>((acc, key) => {
+    if (acc && typeof acc === 'object' && key in (acc as Record<string, unknown>)) {
+      return (acc as Record<string, unknown>)[key];
+    }
+    return undefined;
+  }, json);
+}
+
+export function getDifferences(newDoc: Record<string, unknown>, oldDoc: Record<string, unknown>): string[] {
+  const checks: DifferenceConfig[] = [
+    { label: 'Especialidad', path: ['especialidad'] },
+    { label: 'Tasas', path: ['bloques_detectados', 'pide_tasas'], formatter: (v) => (v ? 'Sí' : 'No') },
+    {
+      label: 'Adaptación discapacidad',
+      path: ['bloques_detectados', 'solicita_adaptacion_discapacidad'],
+      formatter: (v) => (v ? 'Sí' : 'No'),
+    },
+    { label: 'Carnet Bombero', path: ['bloques_detectados', 'especialidad_carnet_bombero'], formatter: (v) => (v ? 'Sí' : 'No') },
+    { label: 'Carnet Medicina', path: ['bloques_detectados', 'especialidad_medicina'], formatter: (v) => (v ? 'Sí' : 'No') },
+    { label: 'Comentarios', path: ['comentarios'] },
+  ];
+
+  return checks
+    .map((check) => {
+      const oldValue = getValueFromPath(oldDoc, check.path);
+      const newValue = getValueFromPath(newDoc, check.path);
+      const format = check.formatter ?? ((value: unknown) => String(value ?? ''));
+      if (format(oldValue) !== format(newValue)) {
+        return `${check.label}: ${format(oldValue) || 'N/A'} → ${format(newValue) || 'N/A'}`;
+      }
+      return null;
+    })
+    .filter((item): item is string => Boolean(item));
+}
+
+export function compareDocuments(
+  nuevoDocumento: Record<string, unknown>,
+  concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[]
+): MatchResult[] {
+  const nuevoTexto = flattenJson(nuevoDocumento);
+  if (!nuevoTexto) return [];
+
+  return concursos
+    .map((concurso) => {
+      const textoExistente = flattenJson(concurso.json_datos);
+      const score = cosineSimilarity(nuevoTexto, textoExistente);
+      const diferencias = getDifferences(nuevoDocumento, concurso.json_datos);
+      return {
+        id: concurso.id ?? 0,
+        nombre_archivo: concurso.nombre_archivo,
+        score,
+        descripcion: extractEspecialidad(concurso.json_datos),
+        diferencias,
       };
     })
     .filter((item) => item.score > 0)

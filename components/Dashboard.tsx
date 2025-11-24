@@ -12,10 +12,10 @@ import {
   ClusterGroup,
   MatchResult,
   clusterConcursos,
+  compareDocuments,
   extractBooleanFilters,
   extractEspecialidad,
   flattenJson,
-  rankSimilarConcursos,
 } from '@/lib/analysis';
 
 type FormValues = {
@@ -26,6 +26,7 @@ type FormValues = {
   especialidad?: string;
   tasas?: string;
   comentarios?: string;
+  [key: string]: string | boolean | undefined;
 };
 
 const columns: { key: keyof Concurso | 'especialidad' | 'acciones'; label: string }[] = [
@@ -98,6 +99,8 @@ export function Dashboard() {
   const [selectedConcursoId, setSelectedConcursoId] = useState<number | null>(null);
   const [formValues, setFormValues] = useState<FormValues>({ nombre: '', apellidos: '', tasas: 'No' });
   const [formMessage, setFormMessage] = useState<string | null>(null);
+  const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [similarityThreshold, setSimilarityThreshold] = useState(0.6);
 
   useEffect(() => {
     if (concursos?.length && selectedConcursoId === null) {
@@ -189,7 +192,7 @@ export function Dashboard() {
     });
   }, [concursos, filters, search]);
 
-  const clusters = useMemo<ClusterGroup[]>(() => clusterConcursos(filteredConcursos), [filteredConcursos]);
+  const clusters = useMemo<ClusterGroup[]>(() => clusterConcursos(filteredConcursos, similarityThreshold), [filteredConcursos, similarityThreshold]);
 
   const selectedConcurso = useMemo(
     () => filteredConcursos.find((c) => c.id === selectedConcursoId) ?? concursos?.find((c) => c.id === selectedConcursoId),
@@ -208,10 +211,40 @@ export function Dashboard() {
       especialidad: extractEspecialidad(selectedConcurso.json_datos),
       tasas: bloques.pide_tasas ? 'Sí' : 'No',
       comentarios: '',
+      pide_tasas: Boolean(bloques.pide_tasas),
+      solicita_adaptacion_discapacidad: Boolean(bloques.solicita_adaptacion_discapacidad),
+      especialidad_carnet_bombero: Boolean(bloques.especialidad_carnet_bombero),
+      especialidad_medicina: Boolean(bloques.especialidad_medicina),
+      pide_titulacion: bloques.pide_titulacion ?? '',
+      requisitos_experiencia: bloques.requisitos_experiencia ?? '',
     });
+    setFormErrors({});
   }, [selectedConcurso]);
 
   const queueList = useMemo(() => queue, [queue]);
+
+  const dynamicFields = useMemo(
+    () => {
+      const bloques = (selectedConcurso?.json_datos as Record<string, any>)?.bloques_detectados ?? {};
+      return [
+        { key: 'pide_tasas', label: '¿Pide tasas?', type: 'boolean' as const },
+        { key: 'solicita_adaptacion_discapacidad', label: '¿Solicita adaptación por discapacidad?', type: 'boolean' as const },
+        { key: 'especialidad_carnet_bombero', label: 'Carnet de bombero', type: 'boolean' as const },
+        { key: 'especialidad_medicina', label: 'Carnet de medicina', type: 'boolean' as const },
+        { key: 'pide_titulacion', label: 'Titulación requerida', type: 'text' as const },
+        { key: 'requisitos_experiencia', label: 'Requisitos de experiencia', type: 'text' as const },
+      ].filter((field) => field.type === 'boolean' || bloques[field.key] !== undefined);
+    },
+    [selectedConcurso]
+  );
+
+  const setFieldValue = (key: string, value: string | boolean) => {
+    setFormValues((prev) => ({ ...prev, [key]: value }));
+    setFormErrors((prev) => {
+      const { [key]: _, ...rest } = prev;
+      return rest;
+    });
+  };
 
   const toggleFilter = (key: keyof BooleanFilters) => {
     setFilters((prev) => {
@@ -223,16 +256,39 @@ export function Dashboard() {
 
   const handleExportExcel = useCallback(() => {
     if (!filteredConcursos.length) return;
-    const headers = ['archivo', 'fecha', 'estado', 'especialidad', 'resumen'];
-    const rows = filteredConcursos.map((item) => [
-      item.nombre_archivo,
-      formatDate(item.fecha),
-      item.estado,
-      extractEspecialidad(item.json_datos),
-      flattenJson(item.json_datos).slice(0, 200).replace(/\n/g, ' '),
-    ]);
+
+    const headers = [
+      'Archivo',
+      'Fecha',
+      'Estado',
+      'Especialidad',
+      'Descripción',
+      'Tasas',
+      'Adaptación discapacidad',
+      'Carnet de bombero',
+      'Carnet de medicina',
+    ];
+
+    const escapeCell = (value: string | number | boolean) => `"${String(value).replace(/"/g, '""')}"`;
+
+    const rows = filteredConcursos.map((item) => {
+      const bloques = (item.json_datos as Record<string, any>).bloques_detectados ?? {};
+      const descripcion = flattenJson(item.json_datos).slice(0, 200).replace(/\n/g, ' ');
+      return [
+        item.nombre_archivo,
+        formatDate(item.fecha),
+        item.estado,
+        extractEspecialidad(item.json_datos) || 'Sin especialidad',
+        descripcion,
+        bloques.pide_tasas ? 'Sí' : 'No',
+        bloques.solicita_adaptacion_discapacidad ? 'Sí' : 'No',
+        bloques.especialidad_carnet_bombero ? 'Sí' : 'No',
+        bloques.especialidad_medicina ? 'Sí' : 'No',
+      ];
+    });
+
     const csv = [headers.join(';')]
-      .concat(rows.map((row) => row.map((value) => `"${String(value).replace(/"/g, '""')}"`).join(';')))
+      .concat(rows.map((row) => row.map(escapeCell).join(';')))
       .join('\n');
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
@@ -251,7 +307,7 @@ export function Dashboard() {
     }
     try {
       const parsed = JSON.parse(newDocumentJson) as Record<string, unknown>;
-      const ranked = rankSimilarConcursos(parsed, concursos ?? []);
+      const ranked = compareDocuments(parsed, concursos ?? []);
       setMatchResults(ranked);
     } catch (error) {
       setMatchError('JSON inválido. Asegúrate de que está bien formado.');
@@ -261,21 +317,40 @@ export function Dashboard() {
   const handleFormSubmit = useCallback(
     (event: React.FormEvent<HTMLFormElement>) => {
       event.preventDefault();
-      setFormMessage(null);
+      const errors: Record<string, string> = {};
+
+      if (!formValues.nombre.trim()) errors.nombre = 'El nombre es obligatorio';
+      if (!formValues.apellidos.trim()) errors.apellidos = 'Los apellidos son obligatorios';
       if (formValues.nif && !/^\d{8}[A-Za-z]$/.test(formValues.nif)) {
-        setFormMessage('El DNI/NIE no cumple el formato esperado (8 dígitos + letra).');
-        return;
+        errors.nif = 'El DNI/NIE no cumple el formato esperado (8 dígitos + letra).';
       }
       if (formValues.email && !/.+@.+\..+/.test(formValues.email)) {
-        setFormMessage('El email no es válido.');
+        errors.email = 'El email no es válido.';
+      }
+      if (formValues.tasas && !['Sí', 'No'].includes(String(formValues.tasas))) {
+        errors.tasas = 'Seleccione una opción válida para tasas';
+      }
+
+      setFormErrors(errors);
+      if (Object.keys(errors).length > 0) {
+        setFormMessage('Revisa los errores antes de continuar.');
         return;
       }
+
+      setFormErrors({});
       setFormMessage('Validación correcta. Genera el PDF para el cliente.');
     },
     [formValues]
   );
 
   const handleGeneratePdf = useCallback(() => {
+    const fieldLines = dynamicFields.map((field) => {
+      const value = formValues[field.key];
+      const label = field.label;
+      if (typeof value === 'boolean') return `${label}: ${value ? 'Sí' : 'No'}`;
+      return `${label}: ${value ?? '-'}`;
+    });
+
     const lines = [
       'Solicitud AuditIA',
       `Nombre: ${formValues.nombre || '-'}`,
@@ -284,6 +359,7 @@ export function Dashboard() {
       `Email: ${formValues.email || '-'}`,
       `Especialidad: ${formValues.especialidad || '-'}`,
       `¿Pide tasas?: ${formValues.tasas ?? 'No'}`,
+      ...fieldLines,
       `Comentarios: ${formValues.comentarios || 'Sin observaciones'}`,
     ];
     const blob = buildSimplePdf(lines);
@@ -293,7 +369,7 @@ export function Dashboard() {
     link.download = 'auditia-formulario.pdf';
     link.click();
     URL.revokeObjectURL(url);
-  }, [formValues]);
+  }, [dynamicFields, formValues]);
 
   const renderCluster = (cluster: ClusterGroup) => (
     <div key={cluster.label} className="rounded-lg border border-slate-200 p-4 bg-slate-50">
@@ -463,7 +539,17 @@ export function Dashboard() {
           <h3 className="text-lg font-semibold text-slate-800 flex items-center gap-2">
             <Sparkles className="h-4 w-4" /> Clustering automático
           </h3>
-          <p className="text-sm text-slate-500">Agrupa variantes de convocatorias similares.</p>
+          <div className="flex items-center gap-3 text-sm text-slate-500">
+            <span>Umbral: {(similarityThreshold * 100).toFixed(0)}%</span>
+            <input
+              type="range"
+              min={0.3}
+              max={0.9}
+              step={0.05}
+              value={similarityThreshold}
+              onChange={(e) => setSimilarityThreshold(Number(e.target.value))}
+            />
+          </div>
         </div>
         <div className="grid md:grid-cols-2 gap-3">
           {clusters.map((cluster) => renderCluster(cluster))}
@@ -504,6 +590,13 @@ export function Dashboard() {
                   <div>
                     <p className="text-sm font-medium text-slate-800">{match.nombre_archivo}</p>
                     <p className="text-xs text-slate-500">Especialidad: {match.descripcion || 'N/A'}</p>
+                    {match.diferencias && match.diferencias.length > 0 && (
+                      <ul className="text-xs text-slate-500 list-disc list-inside mt-1 space-y-1">
+                        {match.diferencias.slice(0, 3).map((diff) => (
+                          <li key={diff}>{diff}</li>
+                        ))}
+                      </ul>
+                    )}
                   </div>
                   <span className="text-sm font-semibold text-slate-700">{(match.score * 100).toFixed(1)}%</span>
                 </li>
@@ -538,7 +631,7 @@ export function Dashboard() {
             <input
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               value={formValues.especialidad ?? ''}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, especialidad: e.target.value }))}
+              onChange={(e) => setFieldValue('especialidad', e.target.value)}
             />
           </div>
           <div>
@@ -546,11 +639,12 @@ export function Dashboard() {
             <select
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               value={formValues.tasas}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, tasas: e.target.value }))}
+              onChange={(e) => setFieldValue('tasas', e.target.value)}
             >
               <option value="Sí">Sí</option>
               <option value="No">No</option>
             </select>
+            {formErrors.tasas && <p className="text-xs text-red-600 mt-1">{formErrors.tasas}</p>}
           </div>
         </div>
 
@@ -560,42 +654,70 @@ export function Dashboard() {
             <input
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               value={formValues.nombre}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, nombre: e.target.value }))}
+              onChange={(e) => setFieldValue('nombre', e.target.value)}
             />
+            {formErrors.nombre && <p className="text-xs text-red-600 mt-1">{formErrors.nombre}</p>}
           </div>
           <div>
             <label className="text-xs text-slate-500">Apellidos</label>
             <input
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               value={formValues.apellidos}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, apellidos: e.target.value }))}
+              onChange={(e) => setFieldValue('apellidos', e.target.value)}
             />
+            {formErrors.apellidos && <p className="text-xs text-red-600 mt-1">{formErrors.apellidos}</p>}
           </div>
           <div>
             <label className="text-xs text-slate-500">DNI/NIE (regex)</label>
             <input
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               value={formValues.nif ?? ''}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, nif: e.target.value }))}
+              onChange={(e) => setFieldValue('nif', e.target.value)}
               placeholder="00000000A"
             />
+            {formErrors.nif && <p className="text-xs text-red-600 mt-1">{formErrors.nif}</p>}
           </div>
           <div>
             <label className="text-xs text-slate-500">Email</label>
             <input
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               value={formValues.email ?? ''}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, email: e.target.value }))}
+              onChange={(e) => setFieldValue('email', e.target.value)}
               placeholder="correo@dominio.com"
             />
+            {formErrors.email && <p className="text-xs text-red-600 mt-1">{formErrors.email}</p>}
           </div>
+          {dynamicFields.length > 0 && (
+            <div className="md:col-span-2 grid md:grid-cols-2 gap-4 bg-slate-50 border border-slate-200 rounded-lg p-4">
+              {dynamicFields.map((field) => (
+                <label key={field.key} className="block text-xs text-slate-600">
+                  {field.label}
+                  {field.type === 'boolean' ? (
+                    <input
+                      type="checkbox"
+                      className="ml-2 h-4 w-4 align-middle"
+                      checked={Boolean(formValues[field.key])}
+                      onChange={(e) => setFieldValue(field.key, e.target.checked)}
+                    />
+                  ) : (
+                    <input
+                      className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
+                      value={String(formValues[field.key] ?? '')}
+                      onChange={(e) => setFieldValue(field.key, e.target.value)}
+                    />
+                  )}
+                  {formErrors[field.key] && <p className="text-xs text-red-600 mt-1">{formErrors[field.key]}</p>}
+                </label>
+              ))}
+            </div>
+          )}
           <div className="md:col-span-2">
             <label className="text-xs text-slate-500">Comentarios adicionales</label>
             <textarea
               className="w-full mt-1 border border-slate-200 rounded-lg px-3 py-2 text-sm"
               rows={3}
               value={formValues.comentarios ?? ''}
-              onChange={(e) => setFormValues((prev) => ({ ...prev, comentarios: e.target.value }))}
+              onChange={(e) => setFieldValue('comentarios', e.target.value)}
             />
           </div>
           <div className="md:col-span-2 flex items-center gap-3">
