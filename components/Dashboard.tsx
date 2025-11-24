@@ -10,13 +10,95 @@ import { twMerge } from 'tailwind-merge';
 import {
   BooleanFilters,
   ClusterGroup,
+  ClusterStrategy,
+  DifferenceDetail,
   MatchResult,
   clusterConcursos,
   compareDocuments,
   extractBooleanFilters,
   extractEspecialidad,
   flattenJson,
+  runSimilarityBenchmarks,
 } from '@/lib/analysis';
+
+type ValidationErrorBag = Record<string, string>;
+
+function escapeXml(value: string): string {
+  return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function buildExcelXml(headers: string[], rows: (string | number | boolean)[][]): string {
+  const headerRow = `<Row>${headers
+    .map((cell) => `<Cell><Data ss:Type="String">${escapeXml(cell)}</Data></Cell>`)
+    .join('')}</Row>`;
+  const dataRows = rows
+    .map(
+      (row) =>
+        `<Row>${row
+          .map((cell) => `<Cell><Data ss:Type="String">${escapeXml(String(cell))}</Data></Cell>`)
+          .join('')}</Row>`
+    )
+    .join('');
+
+  return `<?xml version="1.0"?>\n` +
+    '<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet">' +
+    `<Worksheet ss:Name="Informe"><Table>${headerRow}${dataRows}</Table></Worksheet></Workbook>`;
+}
+
+function downloadBlob(content: Blob, filename: string) {
+  const url = URL.createObjectURL(content);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function validateFormValues(values: FormValues, dynamicKeys: { key: string; type: 'boolean' | 'text' }[]): ValidationErrorBag {
+  const errors: ValidationErrorBag = {};
+
+  if (!values.nombre.trim()) errors.nombre = 'El nombre es obligatorio';
+  if (values.nombre && values.nombre.trim().length < 2) errors.nombre = 'Introduce al menos 2 caracteres para el nombre';
+
+  if (!values.apellidos.trim()) errors.apellidos = 'Los apellidos son obligatorios';
+  if (values.apellidos && values.apellidos.trim().length < 2)
+    errors.apellidos = 'Introduce al menos 2 caracteres para los apellidos';
+
+  if (values.nif) {
+    if (!/^\d{8}[A-Za-z]$/.test(values.nif)) {
+      errors.nif = 'El DNI/NIE no cumple el formato esperado (8 dígitos + letra).';
+    }
+  }
+
+  if (values.email) {
+    if (!/.+@.+\..+/.test(values.email)) {
+      errors.email = 'El email no es válido.';
+    }
+  } else {
+    errors.email = 'El correo electrónico es obligatorio';
+  }
+
+  if (values.tasas && !['Sí', 'No'].includes(String(values.tasas))) {
+    errors.tasas = 'Seleccione una opción válida para tasas';
+  }
+
+  if (values.especialidad && values.especialidad.length < 3) {
+    errors.especialidad = 'La especialidad debe tener al menos 3 caracteres';
+  }
+
+  if (values.comentarios && values.comentarios.length > 500) {
+    errors.comentarios = 'El comentario no debe exceder los 500 caracteres';
+  }
+
+  dynamicKeys.forEach((field) => {
+    const value = values[field.key];
+    if (field.type === 'text' && typeof value === 'string' && value.length > 200) {
+      errors[field.key] = 'Este campo no debe superar los 200 caracteres';
+    }
+  });
+
+  return errors;
+}
 
 type FormValues = {
   nombre: string;
@@ -52,14 +134,24 @@ function formatDate(value: string) {
   }
 }
 
-function buildSimplePdf(lines: string[]): Blob {
-  const escapedLines = lines.map((line) => line.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)'));
-  const textContent = ['BT', '/F1 12 Tf', '14 TL', '72 720 Td', `(${escapedLines[0] ?? ''}) Tj`]
-    .concat(escapedLines.slice(1).map((line) => `T* (${line}) Tj`))
+function buildStyledPdf(title: string, sections: { heading: string; lines: string[] }[]): Blob {
+  const escapeLine = (line: string) => line.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  const header = escapeLine(title);
+  const bodyLines = sections
+    .flatMap((section) => [
+      `${section.heading.toUpperCase()}:`,
+      ...section.lines.map((line) => `• ${line}`),
+      ' ',
+    ])
+    .map(escapeLine);
+
+  const textInstructions = ['BT', '/F1 18 Tf', '18 TL', '72 740 Td', `(${header}) Tj`, '/F1 12 Tf', '0 -22 Td']
+    .concat(['(-----------------------------------------------) Tj'])
+    .concat(bodyLines.map((line) => `T* (${line}) Tj`))
     .concat(['ET'])
     .join('\n');
 
-  const stream = `<< /Length ${textContent.length} >>\nstream\n${textContent}\nendstream\n`;
+  const stream = `<< /Length ${textInstructions.length} >>\nstream\n${textInstructions}\nendstream\n`;
   const objects = [
     '1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n',
     '2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n',
@@ -101,6 +193,9 @@ export function Dashboard() {
   const [formMessage, setFormMessage] = useState<string | null>(null);
   const [formErrors, setFormErrors] = useState<Record<string, string>>({});
   const [similarityThreshold, setSimilarityThreshold] = useState(0.6);
+  const [clusterStrategy, setClusterStrategy] = useState<ClusterStrategy>('threshold');
+  const [benchmarkSummary, setBenchmarkSummary] = useState<string>('');
+  const [isBenchmarking, setIsBenchmarking] = useState(false);
 
   useEffect(() => {
     if (concursos?.length && selectedConcursoId === null) {
@@ -192,7 +287,10 @@ export function Dashboard() {
     });
   }, [concursos, filters, search]);
 
-  const clusters = useMemo<ClusterGroup[]>(() => clusterConcursos(filteredConcursos, similarityThreshold), [filteredConcursos, similarityThreshold]);
+  const clusters = useMemo<ClusterGroup[]>(
+    () => clusterConcursos(filteredConcursos, { similarityThreshold, strategy: clusterStrategy }),
+    [clusterStrategy, filteredConcursos, similarityThreshold]
+  );
 
   const selectedConcurso = useMemo(
     () => filteredConcursos.find((c) => c.id === selectedConcursoId) ?? concursos?.find((c) => c.id === selectedConcursoId),
@@ -267,13 +365,13 @@ export function Dashboard() {
       'Adaptación discapacidad',
       'Carnet de bombero',
       'Carnet de medicina',
+      'Comentarios',
     ];
-
-    const escapeCell = (value: string | number | boolean) => `"${String(value).replace(/"/g, '""')}"`;
 
     const rows = filteredConcursos.map((item) => {
       const bloques = (item.json_datos as Record<string, any>).bloques_detectados ?? {};
       const descripcion = flattenJson(item.json_datos).slice(0, 200).replace(/\n/g, ' ');
+      const comentarios = (item.json_datos as Record<string, any>).comentarios ?? 'Sin comentarios';
       return [
         item.nombre_archivo,
         formatDate(item.fecha),
@@ -284,19 +382,15 @@ export function Dashboard() {
         bloques.solicita_adaptacion_discapacidad ? 'Sí' : 'No',
         bloques.especialidad_carnet_bombero ? 'Sí' : 'No',
         bloques.especialidad_medicina ? 'Sí' : 'No',
+        comentarios,
       ];
     });
 
-    const csv = [headers.join(';')]
-      .concat(rows.map((row) => row.map(escapeCell).join(';')))
-      .join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'auditia-informe.xlsx';
-    link.click();
-    URL.revokeObjectURL(url);
+    const xml = buildExcelXml(headers, rows);
+    const blob = new Blob([xml], {
+      type: 'application/vnd.ms-excel;charset=utf-8;',
+    });
+    downloadBlob(blob, 'auditia-informe.xlsx');
   }, [filteredConcursos]);
 
   const handleMatch = useCallback(() => {
@@ -317,19 +411,10 @@ export function Dashboard() {
   const handleFormSubmit = useCallback(
     (event: React.FormEvent<HTMLFormElement>) => {
       event.preventDefault();
-      const errors: Record<string, string> = {};
-
-      if (!formValues.nombre.trim()) errors.nombre = 'El nombre es obligatorio';
-      if (!formValues.apellidos.trim()) errors.apellidos = 'Los apellidos son obligatorios';
-      if (formValues.nif && !/^\d{8}[A-Za-z]$/.test(formValues.nif)) {
-        errors.nif = 'El DNI/NIE no cumple el formato esperado (8 dígitos + letra).';
-      }
-      if (formValues.email && !/.+@.+\..+/.test(formValues.email)) {
-        errors.email = 'El email no es válido.';
-      }
-      if (formValues.tasas && !['Sí', 'No'].includes(String(formValues.tasas))) {
-        errors.tasas = 'Seleccione una opción válida para tasas';
-      }
+      const errors = validateFormValues(
+        formValues,
+        dynamicFields.map((field) => ({ key: field.key, type: field.type }))
+      );
 
       setFormErrors(errors);
       if (Object.keys(errors).length > 0) {
@@ -337,13 +422,22 @@ export function Dashboard() {
         return;
       }
 
-      setFormErrors({});
       setFormMessage('Validación correcta. Genera el PDF para el cliente.');
     },
-    [formValues]
+    [dynamicFields, formValues]
   );
 
   const handleGeneratePdf = useCallback(() => {
+    const errors = validateFormValues(
+      formValues,
+      dynamicFields.map((field) => ({ key: field.key, type: field.type }))
+    );
+    if (Object.keys(errors).length > 0) {
+      setFormErrors(errors);
+      setFormMessage('Revisa los errores antes de generar el PDF.');
+      return;
+    }
+
     const fieldLines = dynamicFields.map((field) => {
       const value = formValues[field.key];
       const label = field.label;
@@ -351,25 +445,70 @@ export function Dashboard() {
       return `${label}: ${value ?? '-'}`;
     });
 
-    const lines = [
-      'Solicitud AuditIA',
-      `Nombre: ${formValues.nombre || '-'}`,
-      `Apellidos: ${formValues.apellidos || '-'}`,
-      `DNI/NIE: ${formValues.nif || '-'}`,
-      `Email: ${formValues.email || '-'}`,
-      `Especialidad: ${formValues.especialidad || '-'}`,
-      `¿Pide tasas?: ${formValues.tasas ?? 'No'}`,
-      ...fieldLines,
-      `Comentarios: ${formValues.comentarios || 'Sin observaciones'}`,
+    const sections = [
+      {
+        heading: 'Datos de contacto',
+        lines: [
+          `Nombre: ${formValues.nombre || '-'}`,
+          `Apellidos: ${formValues.apellidos || '-'}`,
+          `DNI/NIE: ${formValues.nif || '-'}`,
+          `Email: ${formValues.email || '-'}`,
+        ],
+      },
+      {
+        heading: 'Convocatoria detectada',
+        lines: [
+          `Especialidad: ${formValues.especialidad || '-'}`,
+          `¿Pide tasas?: ${formValues.tasas ?? 'No'}`,
+          ...fieldLines,
+        ],
+      },
+      {
+        heading: 'Comentarios',
+        lines: [formValues.comentarios || 'Sin observaciones'],
+      },
+      {
+        heading: 'Generado',
+        lines: [`Fecha: ${new Date().toLocaleString()}`],
+      },
     ];
-    const blob = buildSimplePdf(lines);
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'auditia-formulario.pdf';
-    link.click();
-    URL.revokeObjectURL(url);
+    const blob = buildStyledPdf('Solicitud AuditIA', sections);
+    downloadBlob(blob, 'auditia-formulario.pdf');
   }, [dynamicFields, formValues]);
+
+  const handleBenchmark = useCallback(() => {
+    if (!filteredConcursos.length) {
+      setBenchmarkSummary('Carga algunos documentos para medir el clustering.');
+      return;
+    }
+    setIsBenchmarking(true);
+    const thresholds = [Math.max(0.3, similarityThreshold - 0.1), similarityThreshold, Math.min(0.9, similarityThreshold + 0.1)];
+    const results = runSimilarityBenchmarks(filteredConcursos, thresholds, clusterStrategy);
+    const summary = results
+      .map((item) => `${(item.threshold * 100).toFixed(0)}% → ${item.clusters} grupos en ${item.durationMs.toFixed(1)}ms`)
+      .join(' | ');
+    setBenchmarkSummary(summary);
+    setIsBenchmarking(false);
+  }, [clusterStrategy, filteredConcursos, similarityThreshold]);
+
+  const renderDifferences = (differences?: DifferenceDetail[]) => {
+    if (!differences || differences.length === 0) {
+      return <p className="text-xs text-slate-400">Sin diferencias clave detectadas.</p>;
+    }
+
+    return (
+      <ul className="mt-2 space-y-1">
+        {differences.map((diff) => (
+          <li key={diff.label} className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="px-2 py-1 bg-slate-100 text-slate-700 rounded-full font-semibold">{diff.label}</span>
+            <span className="line-through text-red-600">{diff.previous}</span>
+            <span className="text-slate-400">→</span>
+            <span className="text-green-700 font-semibold">{diff.current}</span>
+          </li>
+        ))}
+      </ul>
+    );
+  };
 
   const renderCluster = (cluster: ClusterGroup) => (
     <div key={cluster.label} className="rounded-lg border border-slate-200 p-4 bg-slate-50">
@@ -535,22 +674,43 @@ export function Dashboard() {
       </section>
 
       <section className="card space-y-4">
-        <div className="flex items-center justify-between">
+        <div className="flex items-center justify-between flex-wrap gap-3">
           <h3 className="text-lg font-semibold text-slate-800 flex items-center gap-2">
             <Sparkles className="h-4 w-4" /> Clustering automático
           </h3>
-          <div className="flex items-center gap-3 text-sm text-slate-500">
-            <span>Umbral: {(similarityThreshold * 100).toFixed(0)}%</span>
-            <input
-              type="range"
-              min={0.3}
-              max={0.9}
-              step={0.05}
-              value={similarityThreshold}
-              onChange={(e) => setSimilarityThreshold(Number(e.target.value))}
-            />
+          <div className="flex flex-wrap items-center gap-3 text-sm text-slate-500">
+            <span className="flex items-center gap-2">
+              Umbral: {(similarityThreshold * 100).toFixed(0)}%
+              <input
+                type="range"
+                min={0.3}
+                max={0.9}
+                step={0.05}
+                value={similarityThreshold}
+                onChange={(e) => setSimilarityThreshold(Number(e.target.value))}
+              />
+            </span>
+            <label className="flex items-center gap-2">
+              Estrategia
+              <select
+                className="border border-slate-200 rounded px-2 py-1 bg-white"
+                value={clusterStrategy}
+                onChange={(e) => setClusterStrategy(e.target.value as ClusterStrategy)}
+              >
+                <option value="threshold">Umbral (rápido)</option>
+                <option value="kmeans">K-means (agrupa por centroides)</option>
+              </select>
+            </label>
+            <button
+              type="button"
+              onClick={handleBenchmark}
+              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-50"
+            >
+              {isBenchmarking ? 'Midiendo...' : 'Benchmark'}
+            </button>
           </div>
         </div>
+        {benchmarkSummary && <p className="text-xs text-slate-500">{benchmarkSummary}</p>}
         <div className="grid md:grid-cols-2 gap-3">
           {clusters.map((cluster) => renderCluster(cluster))}
           {clusters.length === 0 && <p className="text-sm text-slate-500">No hay datos para agrupar todavía.</p>}
@@ -586,19 +746,16 @@ export function Dashboard() {
             <p className="text-sm font-semibold text-slate-700">Coincidencias encontradas:</p>
             <ul className="space-y-2">
               {matchResults.map((match) => (
-                <li key={match.id} className="flex justify-between items-center rounded-lg border border-slate-200 p-3">
-                  <div>
+                <li key={match.id} className="flex justify-between items-start rounded-lg border border-slate-200 p-3 gap-4">
+                  <div className="space-y-1">
                     <p className="text-sm font-medium text-slate-800">{match.nombre_archivo}</p>
                     <p className="text-xs text-slate-500">Especialidad: {match.descripcion || 'N/A'}</p>
-                    {match.diferencias && match.diferencias.length > 0 && (
-                      <ul className="text-xs text-slate-500 list-disc list-inside mt-1 space-y-1">
-                        {match.diferencias.slice(0, 3).map((diff) => (
-                          <li key={diff}>{diff}</li>
-                        ))}
-                      </ul>
-                    )}
+                    {renderDifferences(match.diferencias?.slice(0, 4))}
                   </div>
-                  <span className="text-sm font-semibold text-slate-700">{(match.score * 100).toFixed(1)}%</span>
+                  <div className="text-right">
+                    <span className="text-sm font-semibold text-slate-700">{(match.score * 100).toFixed(1)}%</span>
+                    <p className="text-[11px] text-slate-500">Similitud</p>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -633,6 +790,7 @@ export function Dashboard() {
               value={formValues.especialidad ?? ''}
               onChange={(e) => setFieldValue('especialidad', e.target.value)}
             />
+            {formErrors.especialidad && <p className="text-xs text-red-600 mt-1">{formErrors.especialidad}</p>}
           </div>
           <div>
             <label className="text-xs text-slate-500">¿Pide tasas?</label>
@@ -719,6 +877,7 @@ export function Dashboard() {
               value={formValues.comentarios ?? ''}
               onChange={(e) => setFieldValue('comentarios', e.target.value)}
             />
+            {formErrors.comentarios && <p className="text-xs text-red-600 mt-1">{formErrors.comentarios}</p>}
           </div>
           <div className="md:col-span-2 flex items-center gap-3">
             <button
