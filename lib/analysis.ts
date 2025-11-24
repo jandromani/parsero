@@ -12,12 +12,26 @@ export type ClusterGroup = {
   ejemplos: string[];
 };
 
+export type DifferenceDetail = {
+  label: string;
+  previous: string;
+  current: string;
+};
+
 export type MatchResult = {
   id: number;
   nombre_archivo: string;
   score: number;
   descripcion?: string;
-  diferencias?: string[];
+  diferencias?: DifferenceDetail[];
+};
+
+export type ClusterStrategy = 'threshold' | 'kmeans';
+
+type ClusterOptions = {
+  similarityThreshold?: number;
+  strategy?: ClusterStrategy;
+  maxIterations?: number;
 };
 
 type DifferenceConfig = {
@@ -56,24 +70,27 @@ function tokenize(text: string): string[] {
     .filter(Boolean);
 }
 
-function cosineSimilarity(a: string, b: string): number {
-  const tokensA = tokenize(a);
-  const tokensB = tokenize(b);
-  if (tokensA.length === 0 || tokensB.length === 0) return 0;
+type TextVector = {
+  resumen: string;
+  tokens: Map<string, number>;
+};
 
-  const freqA = new Map<string, number>();
-  const freqB = new Map<string, number>();
-  tokensA.forEach((t) => freqA.set(t, (freqA.get(t) ?? 0) + 1));
-  tokensB.forEach((t) => freqB.set(t, (freqB.get(t) ?? 0) + 1));
+function vectorizeText(text: string): TextVector {
+  const tokens = tokenize(text);
+  const freq = new Map<string, number>();
+  tokens.forEach((token) => freq.set(token, (freq.get(token) ?? 0) + 1));
+  return { resumen: text, tokens: freq };
+}
 
-  const allTokens = new Set([...freqA.keys(), ...freqB.keys()]);
+function cosineSimilarityFromVectors(a: TextVector, b: TextVector): number {
+  const allTokens = new Set([...a.tokens.keys(), ...b.tokens.keys()]);
   let dot = 0;
   let magA = 0;
   let magB = 0;
 
   for (const token of allTokens) {
-    const aVal = freqA.get(token) ?? 0;
-    const bVal = freqB.get(token) ?? 0;
+    const aVal = a.tokens.get(token) ?? 0;
+    const bVal = b.tokens.get(token) ?? 0;
     dot += aVal * bVal;
     magA += aVal * aVal;
     magB += bVal * bVal;
@@ -83,19 +100,30 @@ function cosineSimilarity(a: string, b: string): number {
   return dot / (Math.sqrt(magA) * Math.sqrt(magB));
 }
 
-export function clusterConcursos(
-  concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[],
-  similarityThreshold = 0.6
-): ClusterGroup[] {
-  const clusters: ClusterGroup[] = [];
+function cosineSimilarity(a: string, b: string): number {
+  return cosineSimilarityFromVectors(vectorizeText(a), vectorizeText(b));
+}
 
-  concursos.forEach((concurso) => {
-    const texto = extractEspecialidad(concurso.json_datos) || concurso.nombre_archivo;
-    const resumen = texto || flattenJson(concurso.json_datos);
-    let targetCluster: ClusterGroup | undefined;
+function buildLabelFromTokens(vector: TextVector, fallback: string): string {
+  const sortedTokens = [...vector.tokens.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 4)
+    .map((entry) => entry[0]);
+  if (sortedTokens.length === 0) return fallback;
+  return sortedTokens.join(' ');
+}
+
+function clusterByThreshold(
+  items: { id?: number; nombre_archivo: string; vector: TextVector }[],
+  similarityThreshold: number
+): ClusterGroup[] {
+  const clusters: (ClusterGroup & { vector: TextVector })[] = [];
+
+  items.forEach((item) => {
+    let targetCluster: (ClusterGroup & { vector: TextVector }) | undefined;
 
     for (const cluster of clusters) {
-      const sim = cosineSimilarity(cluster.label, resumen);
+      const sim = cosineSimilarityFromVectors(cluster.vector, item.vector);
       if (sim >= similarityThreshold) {
         targetCluster = cluster;
         break;
@@ -104,22 +132,145 @@ export function clusterConcursos(
 
     if (!targetCluster) {
       targetCluster = {
-        label: resumen || 'Sin clasificar',
+        label: buildLabelFromTokens(item.vector, item.vector.resumen || 'Sin clasificar'),
         size: 0,
         ids: [],
         ejemplos: [],
+        vector: item.vector,
       };
       clusters.push(targetCluster);
     }
 
     targetCluster.size += 1;
-    if (concurso.id !== undefined) targetCluster.ids.push(concurso.id);
+    if (item.id !== undefined) targetCluster.ids.push(item.id);
     if (targetCluster.ejemplos.length < 3) {
-      targetCluster.ejemplos.push(concurso.nombre_archivo);
+      targetCluster.ejemplos.push(item.nombre_archivo);
     }
   });
 
-  return clusters.sort((a, b) => b.size - a.size);
+  return clusters
+    .map(({ vector: _vector, ...rest }) => rest)
+    .sort((a, b) => b.size - a.size);
+}
+
+function averageVectors(vectors: TextVector[]): TextVector {
+  const accumulator = new Map<string, number>();
+
+  vectors.forEach((vector) => {
+    vector.tokens.forEach((value, key) => {
+      accumulator.set(key, (accumulator.get(key) ?? 0) + value);
+    });
+  });
+
+  const averaged = new Map<string, number>();
+  accumulator.forEach((value, key) => {
+    averaged.set(key, value / vectors.length);
+  });
+
+  return { resumen: '', tokens: averaged };
+}
+
+function clusterWithKMeans(
+  items: { id?: number; nombre_archivo: string; vector: TextVector }[],
+  iterations = 5
+): ClusterGroup[] {
+  if (items.length === 0) return [];
+  const k = Math.max(1, Math.min(8, Math.round(Math.sqrt(items.length / 2))));
+  const centroids = items.slice(0, k).map((item) => item.vector);
+
+  let assignments: number[] = new Array(items.length).fill(0);
+
+  for (let iter = 0; iter < iterations; iter += 1) {
+    let changed = false;
+
+    assignments = items.map((item, idx) => {
+      let best = 0;
+      let bestScore = -Infinity;
+      centroids.forEach((centroid, cIdx) => {
+        const score = cosineSimilarityFromVectors(item.vector, centroid);
+        if (score > bestScore) {
+          bestScore = score;
+          best = cIdx;
+        }
+      });
+      if (best !== assignments[idx]) changed = true;
+      return best;
+    });
+
+    if (!changed) break;
+
+    const grouped = new Map<number, TextVector[]>();
+    assignments.forEach((clusterIndex, idx) => {
+      const current = grouped.get(clusterIndex) ?? [];
+      current.push(items[idx].vector);
+      grouped.set(clusterIndex, current);
+    });
+
+    grouped.forEach((vectors, clusterIndex) => {
+      if (vectors.length > 0) centroids[clusterIndex] = averageVectors(vectors);
+    });
+  }
+
+  const clusterMap = new Map<number, ClusterGroup>();
+  assignments.forEach((clusterIndex, idx) => {
+    const item = items[idx];
+    const cluster = clusterMap.get(clusterIndex) ?? {
+      label: buildLabelFromTokens(centroids[clusterIndex], item.vector.resumen || 'Cluster'),
+      size: 0,
+      ids: [],
+      ejemplos: [],
+    };
+    cluster.size += 1;
+    if (item.id !== undefined) cluster.ids.push(item.id);
+    if (cluster.ejemplos.length < 3) cluster.ejemplos.push(item.nombre_archivo);
+    clusterMap.set(clusterIndex, cluster);
+  });
+
+  return [...clusterMap.values()].sort((a, b) => b.size - a.size);
+}
+
+export function clusterConcursos(
+  concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[],
+  similarityThresholdOrOptions: number | ClusterOptions = 0.6,
+  legacyStrategy?: ClusterStrategy
+): ClusterGroup[] {
+  const options: ClusterOptions =
+    typeof similarityThresholdOrOptions === 'number'
+      ? { similarityThreshold: similarityThresholdOrOptions, strategy: legacyStrategy }
+      : similarityThresholdOrOptions;
+
+  const similarityThreshold = options.similarityThreshold ?? 0.6;
+  const strategy = options.strategy ?? 'threshold';
+  const iterations = options.maxIterations ?? 5;
+
+  const items = concursos.map((concurso) => {
+    const texto = extractEspecialidad(concurso.json_datos) || concurso.nombre_archivo;
+    const resumen = texto || flattenJson(concurso.json_datos);
+    return {
+      id: concurso.id,
+      nombre_archivo: concurso.nombre_archivo,
+      vector: vectorizeText(resumen),
+    };
+  });
+
+  if (strategy === 'kmeans' && items.length > 2) {
+    return clusterWithKMeans(items, iterations);
+  }
+
+  return clusterByThreshold(items, similarityThreshold);
+}
+
+export function runSimilarityBenchmarks(
+  concursos: { id?: number; nombre_archivo: string; json_datos: Record<string, unknown> }[],
+  thresholds: number[],
+  strategy: ClusterStrategy = 'threshold'
+): { threshold: number; durationMs: number; clusters: number }[] {
+  return thresholds.map((threshold) => {
+    const start = performance.now();
+    const groups = clusterConcursos(concursos, { similarityThreshold: threshold, strategy });
+    const end = performance.now();
+    return { threshold, durationMs: end - start, clusters: groups.length };
+  });
 }
 
 export function rankSimilarConcursos(
@@ -154,7 +305,7 @@ function getValueFromPath(json: Record<string, unknown> | undefined, path: strin
   }, json);
 }
 
-export function getDifferences(newDoc: Record<string, unknown>, oldDoc: Record<string, unknown>): string[] {
+export function getDifferences(newDoc: Record<string, unknown>, oldDoc: Record<string, unknown>): DifferenceDetail[] {
   const checks: DifferenceConfig[] = [
     { label: 'Especialidad', path: ['especialidad'] },
     { label: 'Tasas', path: ['bloques_detectados', 'pide_tasas'], formatter: (v) => (v ? 'Sí' : 'No') },
@@ -174,11 +325,15 @@ export function getDifferences(newDoc: Record<string, unknown>, oldDoc: Record<s
       const newValue = getValueFromPath(newDoc, check.path);
       const format = check.formatter ?? ((value: unknown) => String(value ?? ''));
       if (format(oldValue) !== format(newValue)) {
-        return `${check.label}: ${format(oldValue) || 'N/A'} → ${format(newValue) || 'N/A'}`;
+        return {
+          label: check.label,
+          previous: format(oldValue) || 'N/A',
+          current: format(newValue) || 'N/A',
+        };
       }
       return null;
     })
-    .filter((item): item is string => Boolean(item));
+    .filter((item): item is DifferenceDetail => Boolean(item));
 }
 
 export function compareDocuments(
